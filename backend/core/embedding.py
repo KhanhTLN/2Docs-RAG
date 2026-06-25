@@ -38,12 +38,14 @@ class BGEM3Embedder:
 
     def _load(self):
         try:
+            import torch
             from FlagEmbedding import BGEM3FlagModel
-            logger.info(f"Loading {self._model_name} ...")
+            device = "GPU (CUDA)" if torch.cuda.is_available() else "CPU"
+            logger.info(f"Loading {self._model_name} trên {device} ...")
             self._model = BGEM3FlagModel(
                 self._model_name, use_fp16=self._fp16
             )
-            logger.info("BGE-M3 sẵn sàng")
+            logger.info(f"BGE-M3 sẵn sàng — đang sử dụng {device}")
         except ImportError:
             raise RuntimeError("pip install FlagEmbedding")
         except Exception as e:

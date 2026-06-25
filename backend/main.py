@@ -165,7 +165,11 @@ async def ingest(
     doc_b    = reader.read(path_b)
     chunks_a = chunker.chunk(doc_a, doc_id=f"{sid}_A", source=DocSource.A, session_id=sid)
     chunks_b = chunker.chunk(doc_b, doc_id=f"{sid}_B", source=DocSource.B, session_id=sid)
-
+    print(f"\n=== XEM THỬ 3 CHUNK ĐẦU TIÊN CỦA BẢN A ===")
+    for i, c in enumerate(chunks_a[:3]):
+        print(f"--- Chunk {i+1} ---")
+        print(f"Text:\n{c.text}")
+        print(f"Metadata: {c.metadata}\n")    
     db.index_chunks(chunks_a, sid)
     db.index_chunks(chunks_b, sid)
 
@@ -194,14 +198,24 @@ async def compare(req: CompareRequest):
     chunks_a = db.get_all(req.session_id, DocSource.A)
     chunks_b = db.get_all(req.session_id, DocSource.B)
 
+    t_match = time.time()
     pairs   = Matcher().match(chunks_a, chunks_b, focus_dieu=req.focus_dieu, top_k=req.top_k)
+    t_compare = time.time()
     changes = Comparator().compare_all(pairs)
+    t_report = time.time()
     report  = Reporter().build(
         session_id  = req.session_id,
         changes     = changes,
         name_a      = f"Tai lieu A (session {req.session_id})",
         name_b      = f"Tai lieu B (session {req.session_id})",
         elapsed_sec = time.time() - t0,
+    )
+    t_end = time.time()
+    logger.info(
+        f"[PROFILE] total={t_end-t0:.1f}s | "
+        f"matcher={t_compare-t_match:.1f}s | "
+        f"comparator={t_report-t_compare:.1f}s | "
+        f"reporter={t_end-t_report:.1f}s"
     )
 
     return CompareResponse(

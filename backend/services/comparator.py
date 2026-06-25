@@ -43,10 +43,16 @@ class Comparator:
     # ── Public ────────────────────────────────────────────────────────
 
     def compare_all(self, pairs: List[MatchedPair]) -> List[ChangeItem]:
+        import time
+        t0 = time.time()
         results: List[ChangeItem] = []
         for pair in pairs:
             results.extend(self._compare_one(pair))
-        logger.info(f"Tổng: {len(results)} thay đổi")
+        elapsed = time.time() - t0
+        logger.info(
+            f"[PROFILE] compare_all={elapsed:.1f}s | "
+            f"pairs={len(pairs)} | changes={len(results)}"
+        )
         return results
 
     # ── Core comparison ───────────────────────────────────────────────
@@ -73,7 +79,54 @@ class Comparator:
                 citation_a=None, citation_b=None, muc_do="thap",
             )]
 
+        # ── Fast/Medium path: skip LLM khi similarity đủ cao ──────
         context = pair.chunk_a.metadata.heading_path or pair.chunk_b.metadata.heading_path
+        vi_tri = self._resolve_vi_tri("", pair.chunk_a, pair.chunk_b)
+        sim = pair.sim_score
+        ratio = SequenceMatcher(None,
+            self._normalize(pair.chunk_a.text)[:2000],
+            self._normalize(pair.chunk_b.text)[:2000],
+        ).ratio()
+        has_critical = self._critical_legal_signal_changed(
+            pair.chunk_a.text, pair.chunk_b.text
+        )
+
+        # FAST PATH: gần giống hệt → skip LLM
+        if (sim >= 0.97 or ratio >= 0.97) and not has_critical:
+            logger.info(f"[FAST_SKIP] sim={sim:.3f} ratio={ratio:.3f} vi_tri=[{vi_tri}]")
+            return items + [ChangeItem(
+                change_type=ChangeType.MODIFIED,
+                mo_ta="Khác biệt không đáng kể, nội dung gần tương đương.",
+                vi_tri=vi_tri,
+                citation_a=Citation(source=DocSource.A, text=pair.chunk_a.text[:200].strip(),
+                                    heading_path=pair.chunk_a.metadata.heading_path,
+                                    chunk_index=pair.chunk_a.metadata.chunk_index),
+                citation_b=Citation(source=DocSource.B, text=pair.chunk_b.text[:200].strip(),
+                                    heading_path=pair.chunk_b.metadata.heading_path,
+                                    chunk_index=pair.chunk_b.metadata.chunk_index),
+                muc_do="thap",
+                ly_giai=f"Similarity={sim:.3f}, SequenceMatcher={ratio:.3f}. Không phát hiện thay đổi pháp lý quan trọng.",
+            )]
+
+        # MEDIUM PATH: tương đồng cao + không có tín hiệu pháp lý quan trọng
+        if sim >= 0.90 and not has_critical:
+            logger.info(f"[FAST_MODIFIED] sim={sim:.3f} ratio={ratio:.3f} vi_tri=[{vi_tri}]")
+            return items + [ChangeItem(
+                change_type=ChangeType.MODIFIED,
+                mo_ta=f"Nội dung thay đổi nhỏ tại: {vi_tri}" if vi_tri else "Nội dung thay đổi nhỏ",
+                vi_tri=vi_tri,
+                citation_a=Citation(source=DocSource.A, text=pair.chunk_a.text[:220].strip(),
+                                    heading_path=pair.chunk_a.metadata.heading_path,
+                                    chunk_index=pair.chunk_a.metadata.chunk_index),
+                citation_b=Citation(source=DocSource.B, text=pair.chunk_b.text[:220].strip(),
+                                    heading_path=pair.chunk_b.metadata.heading_path,
+                                    chunk_index=pair.chunk_b.metadata.chunk_index),
+                muc_do="thap",
+                ly_giai=f"Khác biệt nhỏ, độ tương đồng cao (sim={sim:.3f}, ratio={ratio:.3f}).",
+            )]
+
+        # ── LLM path: chỉ cho case thực sự cần phân tích sâu ─────
+        logger.info(f"[LLM_COMPARE] sim={sim:.3f} ratio={ratio:.3f} critical={has_critical} vi_tri=[{vi_tri}]")
         try:
             raw_items = self.llm.compare_chunks(
                 pair.chunk_a.text, pair.chunk_b.text, context=context

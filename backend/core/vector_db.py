@@ -9,6 +9,9 @@ from typing import List, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Tắt telemetry PostHog của ChromaDB trước khi import
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+
 from schemas import Chunk, ChunkMeta, RetrievalResult, DocSource
 
 logger = logging.getLogger(__name__)

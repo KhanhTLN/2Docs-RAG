@@ -78,7 +78,7 @@ class LLMEngine:
         loc = f"Vị trí: {context}\n\n" if context else ""
 
         # FIX: giới hạn độ dài đoạn gửi vào LLM (tránh vượt num_ctx)
-        MAX_CHUNK_CHARS = 2000
+        MAX_CHUNK_CHARS = 1000
         a_text = text_a[:MAX_CHUNK_CHARS].strip()
         b_text = text_b[:MAX_CHUNK_CHARS].strip()
 
@@ -171,10 +171,19 @@ class LLMEngine:
         }
 
     def _chat(self, prompt: str, system: Optional[str] = None) -> str:
+        import time
+        total_chars = len(prompt) + (len(system) if system else 0)
+        est_tokens = total_chars // 3
+        logger.info(
+            f"[PROFILE] llm_request | prompt_chars={len(prompt)} "
+            f"total_chars={total_chars} est_tokens≈{est_tokens}"
+        )
+
         msgs = []
         if system:
             msgs.append({"role": "system", "content": system})
         msgs.append({"role": "user", "content": prompt})
+        t0 = time.time()
         try:
             r = requests.post(
                 f"{self._url}/api/chat",
@@ -185,15 +194,21 @@ class LLMEngine:
                     "options": {
                         "temperature":    self._temp,
                         "num_predict":    self._maxt,
-                        "num_ctx":        self._num_ctx,      # FIX MỚI
-                        "repeat_penalty": self._repeat_pen,   # FIX MỚI
-                        "top_p":          self._top_p,        # FIX MỚI
+                        "num_ctx":        self._num_ctx,
+                        "repeat_penalty": self._repeat_pen,
+                        "top_p":          self._top_p,
                     },
                 },
                 timeout=self._tout,
             )
             r.raise_for_status()
-            return r.json()["message"]["content"].strip()
+            elapsed = time.time() - t0
+            content = r.json()["message"]["content"].strip()
+            logger.info(
+                f"[PROFILE] llm_response | time={elapsed:.1f}s | "
+                f"response_chars={len(content)}"
+            )
+            return content
         except requests.Timeout:
             raise TimeoutError(f"LLM timeout sau {self._tout}s.")
         except requests.HTTPError as e:
@@ -243,6 +258,8 @@ class LLMEngine:
                     result.append(obj)
             except json.JSONDecodeError:
                 continue
+        if not result and raw.strip() not in ("[]", ""):
+            logger.warning(f"[LLM_PARSE_FAIL] Không parse được JSON | raw={raw[:500]}")
         return result
 
 
