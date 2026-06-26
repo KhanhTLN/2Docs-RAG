@@ -104,9 +104,16 @@ class Reporter:
     def _dedup(changes: List[ChangeItem]) -> List[ChangeItem]:
         """
         Dedup mạnh: gộp các thay đổi cùng (vi_tri, change_type) thành 1.
-        Giữ lại bản có muc_do cao nhất và mo_ta dài nhất (chất lượng tốt hơn).
+        Giữ lại bản có muc_do cao nhất; với SUA ưu tiên mô tả cụm từ hơn sửa dòng.
         """
         _muc_do_score = {"cao": 3, "trung binh": 2, "thap": 1}
+
+        def _sua_score(c: ChangeItem) -> tuple[int, int, int]:
+            mo = c.mo_ta.strip()
+            phrase = 1 if mo.startswith("Thay đổi cụm từ") else 0
+            rule = 1 if mo.startswith("Thay đổi ") and not mo.startswith("Thay đổi cụm từ") else 0
+            line = -1 if mo.startswith("Sửa dòng:") else 0
+            return (phrase + rule, line, len(mo))
 
         # Bước 1: Gộp theo (vi_tri, change_type) — giữ bản tốt nhất
         best: dict[tuple, ChangeItem] = {}
@@ -114,14 +121,17 @@ class Reporter:
             key = (c.vi_tri.strip(), c.change_type)
             if key not in best:
                 best[key] = c
-            else:
-                old = best[key]
-                old_score = _muc_do_score.get(old.muc_do, 0)
-                new_score = _muc_do_score.get(c.muc_do, 0)
-                # Ưu tiên: muc_do cao hơn, nếu bằng thì mo_ta dài hơn
-                if new_score > old_score or (
-                    new_score == old_score and len(c.mo_ta) > len(old.mo_ta)
-                ):
+                continue
+            old = best[key]
+            old_score = _muc_do_score.get(old.muc_do, 0)
+            new_score = _muc_do_score.get(c.muc_do, 0)
+            if new_score > old_score:
+                best[key] = c
+            elif new_score == old_score:
+                if c.change_type == ChangeType.MODIFIED:
+                    if _sua_score(c) > _sua_score(old):
+                        best[key] = c
+                elif len(c.mo_ta) > len(old.mo_ta):
                     best[key] = c
 
         result = list(best.values())

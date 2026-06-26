@@ -9,15 +9,56 @@ from services.reader import ParsedDoc
 
 logger = logging.getLogger(__name__)
 
-RE_DIEU    = re.compile(r"^(Dieu\s+\d+[\.\:\s].{0,100})$",   re.IGNORECASE)
-RE_DIEU_VN = re.compile(r"^(\u0110i\u1ec1u\s+\d+[\.\:\s].{0,100})$", re.IGNORECASE)
-RE_KHOAN   = re.compile(r"^(\d+[\.\)]\s+\S.{0,100})$")
+RE_DIEU    = re.compile(r"^(?:Dieu|DIEU)\s+\d+", re.IGNORECASE)
+RE_DIEU_VN = re.compile(r"^(?:\u0110i\u1ec1u|\u0110I\u1ec0U)\s+\d+", re.IGNORECASE)
+RE_KHOAN   = re.compile(r"^(\d+(?:\.\d+)+)\.?\s+\S|^\d+[\.\)]\s+\S")
 RE_DIEM    = re.compile(r"^([a-z\u0111\u0110]\)\s+.{0,100})$")
 RE_PHU_LUC = re.compile(r"^(Ph\u1ee5\s*l\u1ee5c\s+[\dA-Z]+.{0,80})$", re.IGNORECASE)
+RE_DIEU_INLINE = re.compile(
+    r"(?:Điều|ĐIỀU|Dieu|DIEU)\s+(\d+)\s*[\.\:]?\s*([^\n]{0,80})?",
+    re.IGNORECASE,
+)
+RE_KHOAN_INLINE = re.compile(r"(?:^|\n)\s*(\d+(?:\.\d+)+)\.?\s+\S", re.MULTILINE)
 
 
 def _is_dieu(s: str) -> bool:
     return bool(RE_DIEU.match(s) or RE_DIEU_VN.match(s))
+
+
+def _match_khoan(s: str) -> Optional[str]:
+    """Trả về mã khoản: '4.3', '6.2.2', '13.1'..."""
+    m = re.match(r"^(\d+(?:\.\d+)+)\.?\s+\S", s)
+    if m:
+        return m.group(1)
+    m = re.match(r"^(\d+)[\.\)]\s*\S", s)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _dieu_from_khoan(khoan: str) -> str:
+    return f"Điều {khoan.split('.')[0]}"
+
+
+def _infer_structure_from_lines(lines: List[str]) -> tuple[Optional[str], Optional[str], str]:
+    """Suy Điều/Khoản từ vài dòng đầu chunk khi metadata trống."""
+    text = "\n".join(lines[:8])
+    m = RE_DIEU_INLINE.search(text)
+    if m:
+        num, title = m.group(1), (m.group(2) or "").strip().rstrip(".:")
+        dieu = f"Điều {num}" + (f": {title}" if title else "")
+        return dieu, None, dieu
+    m = RE_KHOAN_INLINE.search(text)
+    if m:
+        kn = m.group(1)
+        dieu = _dieu_from_khoan(kn)
+        return dieu, kn, f"{dieu} > Khoản {kn}"
+    return None, None, ""
+
+
+def _heading_path(dieu: Optional[str], khoan: Optional[str], diem: Optional[str]) -> str:
+    parts = [p for p in [dieu, khoan, diem] if p]
+    return " > ".join(parts)
 
 
 class Chunker:
@@ -63,13 +104,19 @@ class Chunker:
             body = "\n".join(cur_lines).strip()
             if len(body) < self.min_size:
                 return
-            hp = " > ".join(p for p in [cur_dieu, cur_khoan, cur_diem] if p) \
-                 or "Phan dau tai lieu"
+
+            dieu, khoan, diem = cur_dieu, cur_khoan, cur_diem
+            hp = _heading_path(dieu, khoan, diem)
+            if not hp:
+                idieu, ikhoan, ihp = _infer_structure_from_lines(cur_lines)
+                dieu = dieu or idieu
+                khoan = khoan or ikhoan
+                hp = ihp or _heading_path(dieu, khoan, diem) or "Phan dau tai lieu"
             chunks.append(Chunk(
                 text=body,
                 metadata=ChunkMeta(
                     doc_id=doc_id, source=source, session_id=session_id,
-                    dieu=cur_dieu, khoan=cur_khoan, diem=cur_diem,
+                    dieu=dieu, khoan=khoan, diem=diem,
                     page=cur_page, chunk_index=idx, heading_path=hp,
                 ),
             ))
@@ -86,16 +133,15 @@ class Chunker:
                 cur_dieu  = s; cur_khoan = None; cur_diem = None
                 cur_lines = [s]; cur_page = page
 
-            elif RE_KHOAN.match(s) and cur_dieu:
-                if len("\n".join(cur_lines)) > self.overlap:
+            elif (kn := _match_khoan(s)):
+                if len(cur_lines) > 1 or (len(cur_lines) == 1 and cur_lines[0] != cur_dieu):
                     flush()
-                    cur_khoan = s.split()[0]; cur_diem = None
-                    # Fix: giu lai tieu de Dieu hien tai de chunk con co context
-                    cur_lines = ([cur_dieu] if cur_dieu else []) + [s]
-                    cur_page  = page
-                else:
-                    cur_khoan = s.split()[0]
-                    cur_lines.append(s)
+                if not cur_dieu:
+                    cur_dieu = _dieu_from_khoan(kn)
+                cur_khoan = kn
+                cur_diem = None
+                cur_lines = ([cur_dieu] if cur_dieu else []) + [s]
+                cur_page  = page
 
             elif RE_DIEM.match(s) and cur_khoan:
                 cur_diem = s[0]
@@ -106,17 +152,33 @@ class Chunker:
                 if not cur_page and page:
                     cur_page = page
 
-            # Force flush neu chunk qua lon
+            # TỐI ƯU 2: Force flush khi chunk quá lớn (Smart Text Overlap)
             if len("\n".join(cur_lines)) > self.max_size:
+                # Tạm rút dòng hiện tại 's' ra để chuẩn bị flush chunk trước đó
+                if cur_lines[-1] == s:
+                    cur_lines.pop()
+                
+                # Lưu lại nội dung cũ để tính toán Overlap
+                prev_lines = cur_lines.copy()
                 flush()
-                # Fix: luon bat dau chunk moi bang tieu de Dieu
-                # Dam bao chunk_index va dieu/khoan duoc giu lai dung
+                
+                # Khởi tạo chunk mới bằng Tiêu đề Điều/Khoản
                 header = []
                 if cur_dieu:  header.append(cur_dieu)
                 if cur_khoan: header.append(cur_khoan)
-                # Giu 3 dong cuoi lam overlap context
-                tail = cur_lines[-3:] if len(cur_lines) > 3 else cur_lines
-                cur_lines = header + tail
+                
+                # Tính toán Tail Overlap dựa trên số lượng ký tự thực tế (self.overlap)
+                tail = []
+                current_ovl_len = 0
+                for old_line in reversed(prev_lines):
+                    if old_line in header: continue # Không lấy lặp tiêu đề
+                    if current_ovl_len + len(old_line) > self.overlap and tail:
+                        break # Dừng lại nếu đã đủ số lượng ký tự overlap quy định
+                    tail.insert(0, old_line)
+                    current_ovl_len += len(old_line)
+                
+                # Chunk mới = Tiêu đề + Khúc đuôi chunk trước + Dòng hiện tại
+                cur_lines = header + tail + [s]
 
         flush()
         return chunks
@@ -131,11 +193,14 @@ class Chunker:
             snippet = text[start: start + self.max_size].strip()
             if len(snippet) < self.min_size:
                 continue
+            idieu, ikhoan, hp = _infer_structure_from_lines(snippet.splitlines())
             chunks.append(Chunk(
                 text=snippet,
                 metadata=ChunkMeta(
                     doc_id=doc_id, source=source, session_id=session_id,
-                    chunk_index=i, heading_path=f"Doan {i + 1}",
+                    dieu=idieu, khoan=ikhoan,
+                    chunk_index=i,
+                    heading_path=hp or f"Doan {i + 1}",
                 ),
             ))
         return chunks

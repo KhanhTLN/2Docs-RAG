@@ -1,0 +1,445 @@
+================================================================================
+  LEGAL RAG COMPARATOR — LOGIC CHẠY KHI SO SÁNH 2 VĂN BẢN
+  (TTCS_2 — cập nhật theo code hiện tại, 2026-06)
+================================================================================
+
+MỤC LỤC
+  1. Tổng quan
+  2. Điều kiện tiên quyết (Ingest)
+  3. Kích hoạt từ UI
+  4. API POST /compare
+  5. Matcher — ghép chunk A ↔ B
+  6. Comparator — phân tích từng cặp
+  7. Reporter — tổng hợp báo cáo
+  8. LLM — khi nào gọi, gọi ở đâu
+  9. Kết quả trả về
+ 10. Tham số cấu hình chính (config.py)
+ 11. File code liên quan
+ 12. Ví dụ luồng thực tế
+
+
+================================================================================
+1. TỔNG QUAN
+================================================================================
+
+Luồng chính:
+
+  [UI] Bắt đầu so sánh
+    → POST /compare
+      → VectorDB: lấy chunk A, chunk B theo session_id
+      → Matcher.match()       : ghép từng chunk A với chunk B tương ứng
+      → Comparator.compare_all(): phát hiện THEM / XOA / SUA / DOI VI TRI
+      → Reporter.build()      : dedup, sắp xếp, LLM tóm tắt
+    → CompareResponse JSON → UI hiển thị
+
+So sánh KHÔNG đọc file trực tiếp. Phải gọi POST /ingest trước để chunk được
+lưu vào ChromaDB (embedding BGE-M3).
+
+Nguyên tắc thiết kế hiện tại:
+  - Rule/diff engine xử lý đa số cặp; LLM so sánh chỉ là phương án cuối.
+  - Ưu tiên THEM / XOA / SUA và đánh giá muc_do; đổi vị trí chỉ khi rất rõ.
+  - Tránh báo đổi vị trí / thêm-xóa giả khi nội dung thực chất chỉ sửa nhỏ.
+
+
+================================================================================
+2. ĐIỀU KIỆN TIÊN QUYẾT — INGEST
+================================================================================
+
+Endpoint: POST /ingest
+File:     backend/main.py
+
+  Upload file_a + file_b (.docx hoặc .pdf, tối đa 20 MB)
+    → DocumentReader.read()     : đọc paragraph từ DOCX/PDF
+    → Chunker.chunk()           : tách chunk theo cấu trúc pháp lý
+         - Nhận Điều (Điều X / Dieu X, không phân biệt hoa thường)
+         - Nhận Khoản đa cấp: 4.3, 6.2.2, 22.3 (không bắt buộc có dòng Điều trước)
+         - Suy Điều N từ segment đầu của mã khoản (vd. 6.2.2 → Điều 6)
+         - Nhận Điểm a) b) c) đ), Phụ lục
+         - Khi flush chunk mà metadata trống → _infer_structure_from_lines()
+         - Sliding window: cũng suy cấu trúc từ nội dung, không chỉ "Doan N"
+         - Metadata: dieu, khoan, diem, heading_path, chunk_index, page
+    → VectorDB.index_chunks()   : embed BGE-M3 → lưu ChromaDB theo session_id
+    → Trả IngestResponse: session_id, số chunk A/B
+
+Lưu ý: Comparator có thể suy vi_tri từ text chunk ngay cả khi metadata cũ
+       chưa đúng (session ingest trước khi sửa chunker). Ingest lại để metadata
+       trong DB chính xác hơn.
+
+
+================================================================================
+3. KÍCH HOẠT TỪ UI
+================================================================================
+
+File: ui/app.py, ui/api_client.py
+
+  Người dùng bấm "Bắt đầu so sánh" (chỉ bật sau khi ingest xong)
+    → RealClient.compare(session_id, focus_dieu?, top_k=5)
+    → POST {BACKEND_URL}/compare
+         Body JSON: { "session_id", "focus_dieu" (optional), "top_k" }
+    → Lưu kết quả vào session_state → hiển thị Section 3 (Kết quả so sánh)
+
+DEMO_MODE=true → dùng MockClient, không gọi backend thật.
+
+
+================================================================================
+4. API POST /COMPARE
+================================================================================
+
+File: backend/main.py — hàm compare()
+
+  1. Kiểm tra session tồn tại trong ChromaDB
+  2. chunks_a = db.get_all(session_id, source=A)
+     chunks_b = db.get_all(session_id, source=B)
+  3. pairs = Matcher().match(chunks_a, chunks_b, focus_dieu, top_k)
+  4. changes = Comparator().compare_all(pairs)
+  5. report = Reporter().build(session_id, changes, name_a, name_b, elapsed)
+  6. Trả CompareResponse
+
+Log thời gian [PROFILE]:
+  total | matcher | comparator | reporter
+
+
+================================================================================
+5. MATCHER — GHÉP CHUNK A ↔ B
+================================================================================
+
+File: backend/services/matcher.py
+
+Input:  List[Chunk] A, List[Chunk] B
+Output: List[MatchedPair] — mỗi phần tử có chunk_a, chunk_b (hoặc None),
+        sim_score, is_matched, match_strategy
+
+--- Bước 0: Lọc focus_dieu (nếu có) ---
+  Chỉ giữ chunk có heading_path chứa chuỗi focus_dieu.
+
+--- Bước 1: Metadata match (cùng Điều) ---
+  Nhóm chunk theo metadata.dieu
+  Với mỗi dieu chung → _semantic_match (ngưỡng SIM_THRESHOLD + 0.03 ≈ 0.86)
+
+--- Bước 2: Semantic match (chunk còn lại) ---
+  _semantic_match với ngưỡng SIM_THRESHOLD = 0.83
+  Điểm ghép cặp:
+    score = 0.78 × cosine(embedding) + 0.14 × lexical + 0.08 × heading
+  Greedy: lấy cặp điểm cao nhất trước, mỗi chunk chỉ ghép 1 lần.
+
+--- Bước 2b: Merge recovery ---
+  1 chunk A có thể khớp 2 chunk B liền kề đã gộp (_merge_chunks)
+  Ngưỡng: MERGE_SIM_THRESHOLD ≈ 0.74, cửa sổ tối đa MAX_MERGE_WINDOW = 2
+  _merge_chunks: gộp text + suy dieu/khoan/heading_path từ nội dung đã gộp
+
+--- Bước 2c: Content recovery ---
+  Ghép chunk có nội dung chuẩn hóa giống hệt (sim_score = 1.0)
+  Tránh báo THEM/XOA giả khi nội dung chỉ đổi vị trí trong danh sách điểm.
+
+--- Bước 3: Unmatched ---
+  Chunk A chưa ghép → MatchedPair(chunk_a=A, chunk_b=None, is_matched=False)
+  Chunk B chưa ghép → MatchedPair(chunk_a=None, chunk_b=B, is_matched=False)
+
+Embedding: BGE-M3 (backend/core/embedding.py)
+
+
+================================================================================
+6. COMPARATOR — PHÂN TÍCH TỪNG CẶP
+================================================================================
+
+File: backend/services/comparator.py
+
+--- compare_all(pairs) ---
+  1. Xây corpus toàn session (_corpus_a, _corpus_b) — chuẩn hóa text + list item body
+  2. Với mỗi pair → _compare_one(pair)
+  3. Gộp tất cả ChangeItem
+
+--- _compare_one(pair) ---
+
+  A) Cặp một phía
+     A có, B không:
+       - Nếu nội dung A đã có trong corpus B → bỏ qua (không báo XOA)
+       - Ngược lại → ChangeItem DELETED (XOA), muc_do=cao
+
+     B có, A không:
+       - Nếu nội dung B đã có trong corpus A → bỏ qua (skip_false_add)
+       - Ngược lại → ChangeItem ADDED (THEM), muc_do=cao
+
+  B) Cặp có cả A và B
+
+     pending_reorder = _detect_reorder() — chưa thêm ngay, xử lý ở _finish()
+
+     Nếu nội dung chuẩn hóa giống hệt:
+       → UNCHANGED (KHONG DOI NOI DUNG), muc_do=thap
+
+     Tính chỉ số:
+       sim   = pair.sim_score (từ Matcher)
+       ratio = SequenceMatcher trên 2000 ký tự đầu (sau chuẩn hóa)
+
+     Chạy song song 4 detector:
+       rule_raw  = _detect_rule_changes()
+       list_raw  = _detect_list_reorder_changes()  — đổi thứ tự điểm a)b)c)
+       line_raw  = _detect_line_diff_changes()   — thêm/xóa/sửa dòng bullet
+       diff_raw  = _detect_token_diff_changes()  — thêm/xóa/sửa cụm từ
+
+     picked = _merge_raw_changes(rule_raw, diff_raw, line_raw)
+       - Thứ tự ưu tiên gộp: rule → token → line
+       - Bỏ "Sửa dòng" nếu đã có "Thay đổi cụm từ" cùng vùng citation
+       - Token insert: bỏ fragment giả (_is_alignment_fragment), vd. "tài."
+         (mảnh token do lệch căn khi xóa/sửa đoạn dài, đã có trong văn bản đối diện)
+       - Token replace: KHÔNG bỏ qua khi chữ số khác nhau dù ratio >= 0.95
+       - Line replace: bỏ qua khi lr >= 0.85 (để token diff mô tả chính xác hơn)
+
+     Lưới an toàn số liệu (nếu picked vẫn rỗng):
+       if _critical_legal_signal_changed(A, B):
+         picked = _detect_isolated_number_diff(A, B)
+         — bắt ..10.. → ..100.., thời hạn ô điền, số đứng riêng (10 vs 100)
+
+     --- Quyết định [DECISION] ---
+
+     (1) List reorder — chỉ khi TẤT CẢ điều kiện:
+         list_raw có kết quả
+         VÀ picked rỗng (không có thay đổi nội dung thực)
+         VÀ ratio >= 0.95
+         VÀ >= 2 điểm đổi nhãn trong danh sách
+         → DOI VI TRI
+
+     (2) LOW DIFFERENCE — sim >= 0.93 VÀ ratio >= 0.88:
+         - Có picked → trả rule/diff, KHÔNG gọi LLM
+         - Không picked NHƯNG có critical signal → _fallback_modified (cao)
+         - Không picked, không critical → SUA chung "Khác biệt nhỏ...", muc_do=thap
+
+     (3) MEDIUM — sim >= 0.84 VÀ ratio >= 0.72:
+         - Có picked → trả rule/diff [DECISION: medium_rule]
+         - sim > 0.95 & ratio > 0.90, không picked → fallback SUA
+
+     (4) HIGH SIM — sim > 0.95 & ratio > 0.90:
+         - Có picked → rule/diff [DECISION: high_sim_rule]
+         - Không → fallback SUA
+
+     (5) LARGE — LLM so sánh khi _should_call_llm() = True:
+         - KHÔNG gọi nếu sim > 0.95 và ratio > 0.90
+         - KHÔNG gọi nếu sim >= 0.93 và ratio >= 0.88
+         - GỌI khi sim < 0.84 HOẶC ratio < 0.72
+         - Có picked và không cần LLM → [DECISION: rule_engine]
+         - Cần LLM → [DECISION: llm]
+           _extract_diff_excerpts() (~45 từ quanh diff)
+           llm.compare_chunks() — Qwen2.5 qua Ollama
+           _build_item() cho từng JSON trả về
+
+     _finish(result):
+       - Nếu đã có SUA/THEM/XOA → loại REORDERED khỏi kết quả
+       - Nếu result rỗng nhưng có pending_reorder → trả REORDERED
+       - Ngược lại trả result
+
+--- Rule engine (_detect_rule_changes) ---
+
+  Quét lần lượt (Counter diff trên pattern):
+    - Tỉ lệ/tiền tệ (%)
+    - Số tiền (triệu, tỷ...)
+    - Thời hạn (_RE_DURATION): hỗ trợ ..10.. năm, …100…, __10__ + đơn vị
+    - Số ô trống (_RE_FILL_NUM): ..10.., …100…, __10__
+    - Ngày tháng (dd/mm/yyyy)
+    - Chủ thể (Bên A/B, bên thuê...)
+    - Phủ định/quyền (không được, cấm...)
+    - Số liệu tổng quát (fallback nếu các pattern trên không bắt được)
+
+  _detect_isolated_number_diff (lưới an toàn):
+    - Lặp lại fill + duration pattern
+    - Fallback: so sánh số đứng riêng (không nằm trong 3.1, ..10..)
+
+--- Đổi vị trí (hạn chế — ưu tiên thấp) ---
+
+  _detect_reorder (cấp chunk):
+    - Nội dung chưa giống hệt; ratio >= 0.95 giữa 2 chunk
+    - heading Điều khác nhau HOẶC lệch chunk_index >= 3
+    - Bị loại nếu cặp đã có SUA/THEM/XOA (_finish)
+
+  _detect_list_reorder_changes (cấp điểm a)b)c)):
+    - >= 2 dòng dạng "a) ..."
+    - Cùng tập nội dung (Counter), khác gán nhãn
+    - body_ratio >= 0.95
+    - >= 2 điểm thực sự đổi nhãn
+    - Không có fallback chung chung "đổi thứ tự danh sách"
+
+--- vi_tri (vị trí điều khoản) ---
+
+  _resolve_vi_tri():
+    1. Gộp metadata dieu/khoan/diem từ chunk A và B
+    2. Nếu thiếu hoặc heading chung chung → _infer_vi_tri_from_text()
+       (đọc "Điều X" hoặc "N.M" từ nội dung chunk)
+    3. Fallback heading_path (bỏ qua "Phan dau tai lieu", "Doan N")
+    Format chuẩn: "Điều X > Khoản Y > Điểm Z"
+
+--- muc_do (mức độ) ---
+
+  THEM / XOA        → mặc định cao
+  DOI VI TRI        → mặc định trung binh
+  SUA từ rule       → cao khi đổi số/thời hạn/tiền/phủ định
+  SUA từ token      → cao khi chữ số đổi hoặc có phủ định
+  SUA chung/fallback→ _infer_severity() + _critical_legal_signal_changed()
+  _pick_severity()  → max(LLM, heuristic), tối thiểu trung binh nếu critical
+
+
+================================================================================
+7. REPORTER — TỔNG HỢP BÁO CÁO
+================================================================================
+
+File: backend/services/reporter.py
+
+  build(session_id, changes, name_a, name_b, elapsed_sec):
+
+  1. _dedup(changes)
+     Bước 1: Gộp cùng (vi_tri, change_type) — một vị trí một loại
+             - Ưu tiên muc_do cao hơn
+             - Với SUA: ưu tiên mô tả theo thứ tự:
+                 "Thay đổi cụm từ" > "Thay đổi thời hạn/số điền/số liệu" > "Sửa dòng"
+     Bước 2: Gộp trùng theo (change_type, citation_a[:80], citation_b[:80])
+
+  2. Giới hạn MAX_CHANGES = 50
+
+  3. Đếm: added, deleted, modified, unchanged, reordered
+
+  4. llm.summarize() — LLM tóm tắt 3-5 câu (1 lần gọi / session)
+     Lỗi → _fallback_summary() thuần thống kê
+
+  5. display_list = bỏ UNCHANGED, sắp xếp:
+     - THEM/XOA trước → DOI VI TRI → SUA
+     - Trong cùng loại: cao → trung binh → thap
+
+  6. Trả Report → map sang CompareResponse
+
+
+================================================================================
+8. LLM — KHI NÀO GỌI, GỌI Ở ĐÂU
+================================================================================
+
+File: backend/core/llm_engine.py
+
+Có HAI loại gọi LLM, vai trò khác nhau:
+
+  (A) llm.compare_chunks() — SO SÁNH từng cặp chunk
+      Gọi từ: Comparator._compare_one() khi [DECISION: llm]
+      Điều kiện: sim/ratio thấp (xem mục 6, nhánh LARGE)
+      Input:    excerpt ngắn quanh diff + context vi_tri (~600–800 ký tự)
+      Output:   JSON array THEM/XOA/SUA
+      Tần suất: 0–vài lần / session (đa số cặp dùng rule/diff)
+
+  (B) llm.summarize() — TÓM TẮT toàn bộ thay đổi
+      Gọi từ: Reporter.build() — luôn chạy sau dedup
+      Input:    danh sách changes (tối đa 12 mục trong prompt)
+      Output:   đoạn tom_tat 3-5 câu
+      Tần suất: 1 lần / session
+
+Ví dụ log thực tế (21 cặp, ~60s):
+  Matcher     ~1s
+  Comparator  ~30s  (trong đó 1× compare_chunks ~30s tại cặp ratio thấp)
+  Reporter    ~29s  (1× summarize ~29s)
+
+Bottleneck thường là LLM (Ollama/Qwen), không phải Matcher hay rule engine.
+
+
+================================================================================
+9. KẾT QUẢ TRẢ VỀ
+================================================================================
+
+Schema: backend/schemas.py — CompareResponse
+
+  session_id
+  total_changes
+  changes_added      (THEM)
+  changes_deleted    (XOA)
+  changes_modified   (SUA)
+  changes_unchanged  (KHONG DOI NOI DUNG — đếm nhưng không hiển thị)
+  changes_reordered  (DOI VI TRI)
+  change_list[]      — mỗi item:
+      change_type    : THEM | XOA | SUA | DOI VI TRI
+      mo_ta          : mô tả thay đổi
+      vi_tri         : Điều X > Khoản Y > Điểm Z
+      citation_a/b   : trích dẫn văn bản gốc / sửa
+      muc_do         : cao | trung binh | thap
+      ly_giai        : giải thích mức độ (optional)
+  tom_tat            : đoạn tóm tắt LLM
+  processing_time    : giây
+
+
+================================================================================
+10. THAM SỐ CẤU HÌNH CHÍNH (config.py / .env)
+================================================================================
+
+  SIM_THRESHOLD           = 0.83    Ngưỡng ghép cặp semantic
+  MERGE_SIM_THRESHOLD     = 0.74    Ghép 1→N chunk
+  MAX_MERGE_WINDOW        = 2
+  CHUNK_MAX / OVL / MIN   = 2500 / 300 / 30
+
+  SEVERITY_LOW_SIM/RATIO      = 0.93 / 0.88   Nhánh low_diff, không LLM
+  SEVERITY_MEDIUM_SIM/RATIO   = 0.84 / 0.72   Nhánh medium, rule trước LLM
+  SEVERITY_HIGH_SIM/RATIO     = 0.78 / 0.58   Heuristic nâng muc_do
+
+  CITATION_MIN_LEN        = 15
+  MAX_CHANGES             = 50
+  MAX_FILE_MB             = 20
+
+  LLM: Ollama + qwen2.5:7b (LLM_BASE_URL, LLM_MODEL_NAME, LLM_TIMEOUT...)
+  Embedding: BAAI/bge-m3
+
+
+================================================================================
+11. FILE CODE LIÊN QUAN
+================================================================================
+
+  ui/app.py                   Giao diện, nút so sánh
+  ui/api_client.py            Gọi API backend
+  backend/main.py             /ingest, /compare, /health
+  backend/services/reader.py  Đọc DOCX/PDF
+  backend/services/chunker.py Tách chunk + metadata + suy cấu trúc
+  backend/services/matcher.py Ghép chunk A↔B
+  backend/services/comparator.py Phát hiện thay đổi + cổng LLM
+  backend/services/reporter.py  Dedup + tóm tắt
+  backend/core/embedding.py   BGE-M3
+  backend/core/vector_db.py   ChromaDB
+  backend/core/llm_engine.py  Qwen compare_chunks + summarize
+  backend/schemas.py          Kiểu dữ liệu
+  backend/config.py           Ngưỡng và hằng số
+
+
+================================================================================
+12. VÍ DỤ LUỒNG THỰC TẾ
+================================================================================
+
+--- Ví dụ A: Điều 1 — xóa cụm, không báo THEM giả ---
+
+  Matcher: ghép chunk Điều 1 A ↔ B (sim ≈ 0.97)
+  Comparator:
+    token_diff: XOA "thẩm quyền của Tòa án đối với hoạt động trọng tài;"
+    bỏ qua THEM "tài." (_is_alignment_fragment)
+    [DECISION] low_diff hoặc medium_rule — không LLM
+  Reporter: dedup → 1 mục XOA → summarize → UI
+
+--- Ví dụ B: Điều 3 > Khoản 3.1 — ..10.. năm → ..100.. năm ---
+
+  Matcher: ghép cặp (sim ≈ 0.98, ratio ≈ 0.99)
+  Comparator:
+    rule/diff: Thay đổi thời hạn hoặc số điền '..10..' → '..100..'
+    hoặc _detect_isolated_number_diff nếu format ô điền đặc biệt
+    [DECISION] low_diff — không LLM
+    muc_do: cao
+  Reporter: dedup giữ mô tả cụ thể (không "Khác biệt nhỏ...")
+
+--- Ví dụ C: Điều 4 > Khoản 4.3 — sim cao, ratio thấp ---
+
+  Matcher: ghép cùng khoản (sim ≈ 0.97)
+  ratio ≈ 0.23 (nội dung viết lại nhiều)
+  rule/diff không đủ → [DECISION] llm (~30s)
+  Reporter: summarize thêm ~30s
+
+--- Log [DECISION] thường gặp ---
+
+  exact_match    — không đổi
+  low_diff       — rule/diff, sim+ratio cao
+  medium_rule    — rule/diff, nhiều thay đổi (n=...)
+  high_sim_rule  — rule/diff dù sim embedding rất cao
+  rule_engine    — rule/diff, không cần LLM dù sim/ratio trung bình
+  llm            — gọi compare_chunks
+  fallback       — SUA chung khi không rule/LLM
+  skip_false_add — bỏ THEM giả (nội dung đã có ở A)
+  list_reorder   — đổi vị trí điểm (hiếm, điều kiện chặt)
+
+================================================================================
+  Hết tài liệu logic.txt
+================================================================================

@@ -1,4 +1,3 @@
-
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -33,26 +32,26 @@ EMBEDDING_MAXLEN = int(os.getenv("EMBEDDING_MAXLEN", "512"))
 CHROMA_METRIC = os.getenv("CHROMA_METRIC", "cosine")
 
 # ── Chunking ──────────────────────────────────────────────────────────
-
 CHUNK_MAX = int(os.getenv("CHUNK_MAX", "2500"))
 CHUNK_OVL = int(os.getenv("CHUNK_OVL", "300"))
 CHUNK_MIN = int(os.getenv("CHUNK_MIN",  "30"))
 
-# ── Comparison ────────────────────────────────────────────────────────
-# FIX: hạ SIM_THRESHOLD 0.78→0.75 tránh bỏ sót cặp khớp thực
-SIM_THRESHOLD       = float(os.getenv("SIM_THRESHOLD",       "0.75"))
-MERGE_SIM_THRESHOLD = float(os.getenv("MERGE_SIM_THRESHOLD", "0.68"))
+# ── Comparison (Bộ thông số Vàng đã khôi phục) ───────────────────────
+SIM_THRESHOLD       = float(os.getenv("SIM_THRESHOLD",       "0.83"))   # Tăng để lọc bỏ các chunk khớp yếu
+MERGE_SIM_THRESHOLD = float(os.getenv("MERGE_SIM_THRESHOLD", "0.74"))
 MAX_MERGE_WINDOW    = int(os.getenv("MAX_MERGE_WINDOW",       "2"))
 CITATION_MIN_LEN    = int(os.getenv("CITATION_MIN_LEN",       "15"))  
 MAX_CHANGES         = int(os.getenv("MAX_CHANGES",             "50"))
 
-# ── Severity thresholds (dùng trong comparator._infer_severity) ───────
+# ── Severity thresholds (Logic phân tích độ nghiêm trọng) ──────────
 SEVERITY_LOW_SIM_FLOOR     = float(os.getenv("SEVERITY_LOW_SIM_FLOOR",     "0.93"))
 SEVERITY_LOW_RATIO_FLOOR   = float(os.getenv("SEVERITY_LOW_RATIO_FLOOR",   "0.88"))
-SEVERITY_MEDIUM_SIM_FLOOR  = float(os.getenv("SEVERITY_MEDIUM_SIM_FLOOR",  "0.82"))
-SEVERITY_MEDIUM_RATIO_FLOOR= float(os.getenv("SEVERITY_MEDIUM_RATIO_FLOOR","0.70"))
-SEVERITY_HIGH_SIM_FLOOR    = float(os.getenv("SEVERITY_HIGH_SIM_FLOOR",    "0.70"))
-SEVERITY_HIGH_RATIO_FLOOR  = float(os.getenv("SEVERITY_HIGH_RATIO_FLOOR",  "0.42"))
+
+SEVERITY_MEDIUM_SIM_FLOOR  = float(os.getenv("SEVERITY_MEDIUM_SIM_FLOOR",  "0.84"))
+SEVERITY_MEDIUM_RATIO_FLOOR= float(os.getenv("SEVERITY_MEDIUM_RATIO_FLOOR","0.72"))
+
+SEVERITY_HIGH_SIM_FLOOR    = float(os.getenv("SEVERITY_HIGH_SIM_FLOOR",    "0.78"))
+SEVERITY_HIGH_RATIO_FLOOR  = float(os.getenv("SEVERITY_HIGH_RATIO_FLOOR",  "0.58"))
 
 # ── FastAPI ───────────────────────────────────────────────────────────
 API_HOST     = os.getenv("API_HOST",    "0.0.0.0")

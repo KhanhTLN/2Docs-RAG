@@ -22,19 +22,12 @@ class LLMEngine:
     # ── System prompt tối ưu cho 7b ──────────────────────────────────
     # Ngắn hơn nhưng rõ ràng hơn → 7b tuân theo tốt hơn 14b prompt dài
     _SYS_COMPARE = (
-        "Bạn là chuyên gia kiểm tra hợp đồng tiếng Việt.\n"
-        "Nhiệm vụ: So sánh BẢN A (gốc) và BẢN B (mới), liệt kê TẤT CẢ sự thay đổi.\n\n"
-        "QUY TẮC:\n"
-        "• So sánh TỪNG CHỮ SỐ: '10 năm' vs '100 năm' → muc_do=cao\n"
-        "• Phát hiện thay đổi chủ thể, phủ định, điều kiện ràng buộc\n"
-        "• Chỉ trả về KHONG_DOI khi hai đoạn GIỐNG HỆT 100%\n"
-        "• KHÔNG viết giải thích, KHÔNG dùng markdown\n"
-        "• Chỉ trả về JSON array hợp lệ, bắt đầu bằng '[' và kết thúc bằng ']'\n\n"
-        "Schema mỗi phần tử:\n"
-        '{"change_type":"SUA|THEM|XOA|KHONG_DOI|DOI VI TRI","mo_ta":"...","vi_tri":"Điều X Khoản Y Điểm Z",'
-        '"trich_dan_a":"nguyen van trong A","trich_dan_b":"nguyen van trong B","muc_do":"cao|trung binh|thap"}'
+        "So sánh hợp đồng VN. Trả JSON array thay đổi. "
+        'Mỗi phần tử: {"change_type":"SUA|THEM|XOA","mo_ta":"...",'
+        '"vi_tri":"...","trich_dan_a":"...","trich_dan_b":"...",'
+        '"muc_do":"cao|trung binh|thap"}. Không markdown. [] nếu không đổi.'
     )
-
+    
     _SYS_SUMMARY = (
         "Bạn là trợ lý tóm tắt văn bản pháp lý tiếng Việt.\n"
         "Tóm tắt ngắn gọn, khách quan, nêu rõ điều khoản cụ thể."
@@ -75,22 +68,14 @@ class LLMEngine:
         if text_a.strip() == text_b.strip():
             return [self._no_change(context)]
 
-        loc = f"Vị trí: {context}\n\n" if context else ""
-
-        # FIX: giới hạn độ dài đoạn gửi vào LLM (tránh vượt num_ctx)
-        MAX_CHUNK_CHARS = 1000
-        a_text = text_a[:MAX_CHUNK_CHARS].strip()
-        b_text = text_b[:MAX_CHUNK_CHARS].strip()
+        loc = f"{context}\n" if context else ""
+        max_chars = 600 if max(len(text_a), len(text_b)) > 800 else 800
+        a_text = text_a[:max_chars].strip()
+        b_text = text_b[:max_chars].strip()
 
         prompt = (
-            f"{loc}"
-            f"=== BẢN A ===\n{a_text}\n\n"
-            f"=== BẢN B ===\n{b_text}\n\n"
-            "Liệt kê TẤT CẢ thay đổi. Chú ý:\n"
-            "- Số liệu, thời hạn, tỉ lệ\n"
-            "- Chủ thể hành động (Bên A/Bên B)\n"
-            "- Điều kiện ràng buộc, phủ định\n\n"
-            "Trả về JSON array. Trả về [] nếu không có thay đổi."
+            f"{loc}A:\n{a_text}\n\nB:\n{b_text}\n\n"
+            "Liệt kê thay đổi. Trả JSON array."
         )
 
         raw   = self._chat(prompt, self._SYS_COMPARE)
@@ -215,16 +200,45 @@ class LLMEngine:
             raise RuntimeError(f"Ollama HTTP error: {e}")
 
     @staticmethod
+    def _coerce_change_item(x) -> dict | None:
+        if isinstance(x, dict) and "change_type" in x:
+            return x
+        if isinstance(x, str):
+            s = x.strip()
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict) and "change_type" in obj:
+                    return obj
+            except json.JSONDecodeError:
+                pass
+            m = re.search(r"\{[^{}]+\}", s)
+            if m:
+                try:
+                    obj = json.loads(m.group(0))
+                    if isinstance(obj, dict) and "change_type" in obj:
+                        return obj
+                except json.JSONDecodeError:
+                    pass
+        return None
+
+    @staticmethod
+    def _items_from_list(data: list) -> List[dict]:
+        result: List[dict] = []
+        for x in data:
+            item = LLMEngine._coerce_change_item(x)
+            if item:
+                result.append(item)
+        return result
+
+    @staticmethod
     def _parse_list(raw: str) -> List[dict]:
         """
         Parse JSON array từ output của Qwen2.5-7b.
-        Qwen hay thêm text trước/sau JSON → cần extract mạnh hơn.
+        Hỗ trợ array chứa string JSON và text thừa quanh JSON.
         """
-        # Bước 1: bỏ markdown fences
         cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip()
-        cleaned = re.sub(r"```\s*$",         "", cleaned).strip()
+        cleaned = re.sub(r"```\s*$", "", cleaned).strip()
 
-        # Bước 2: tìm đoạn bắt đầu bằng '[' đầu tiên → kết thúc bằng ']' cuối
         start = cleaned.find("[")
         end   = cleaned.rfind("]")
         if start != -1 and end != -1 and end > start:
@@ -232,32 +246,27 @@ class LLMEngine:
             try:
                 data = json.loads(candidate)
                 if isinstance(data, list):
-                    return [x for x in data if isinstance(x, dict) and "change_type" in x]
+                    return LLMEngine._items_from_list(data)
             except json.JSONDecodeError:
                 pass
 
-        # Bước 3: thử sửa JSON lỗi phổ biến (trailing comma, single-quote)
         try:
-            fixed = re.sub(r",\s*([\]}])", r"\1", cleaned)   # trailing comma
-            fixed = fixed.replace("'", '"')                   # single → double quote
+            fixed = re.sub(r",\s*([\]}])", r"\1", cleaned)
+            fixed = fixed.replace("'", '"')
             start2 = fixed.find("[")
             end2   = fixed.rfind("]")
             if start2 != -1 and end2 > start2:
                 data = json.loads(fixed[start2: end2 + 1])
                 if isinstance(data, list):
-                    return [x for x in data if isinstance(x, dict) and "change_type" in x]
+                    return LLMEngine._items_from_list(data)
         except json.JSONDecodeError:
             pass
 
-        # Bước 4: tách từng object riêng lẻ
         result = []
         for obj_str in re.findall(r"\{[^{}]+\}", cleaned, re.DOTALL):
-            try:
-                obj = json.loads(obj_str)
-                if isinstance(obj, dict) and "change_type" in obj:
-                    result.append(obj)
-            except json.JSONDecodeError:
-                continue
+            item = LLMEngine._coerce_change_item(obj_str)
+            if item:
+                result.append(item)
         if not result and raw.strip() not in ("[]", ""):
             logger.warning(f"[LLM_PARSE_FAIL] Không parse được JSON | raw={raw[:500]}")
         return result

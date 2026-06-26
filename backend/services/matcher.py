@@ -75,6 +75,15 @@ class Matcher:
         matched_a.update(merge_ma)
         matched_b.update(merge_mb)
 
+        # ── Bước 2c: ghép chunk trùng nội dung (tránh THEM/XOA giả khi reorder) ──
+        remaining_a = [c for c in chunks_a if id(c) not in matched_a]
+        remaining_b = [c for c in chunks_b if id(c) not in matched_b]
+
+        content_pairs, content_ma, content_mb = self._content_recovery(remaining_a, remaining_b)
+        pairs.extend(content_pairs)
+        matched_a.update(content_ma)
+        matched_b.update(content_mb)
+
         # ── Bước 3: unmatched → THÊM / XÓA ───────────────────────────
         for c in chunks_a:
             if id(c) not in matched_a:
@@ -196,6 +205,57 @@ class Matcher:
             {id(chunks_b[ib]) for ib in matched_b},
         )
 
+    def _content_recovery(
+        self,
+        ca_list: List[Chunk],
+        cb_list: List[Chunk],
+    ) -> Tuple[List[MatchedPair], Set[int], Set[int]]:
+        """Ghép các chunk có nội dung chuẩn hóa giống nhau (ví dụ điểm đ) sau reorder."""
+        if not ca_list or not cb_list:
+            return [], set(), set()
+
+        def _keys(text: str) -> set[str]:
+            keys = {self._normalize_text(text)}
+            m = re.match(r"^[a-z\u0111]\)\s*(.+)$", text.strip(), re.IGNORECASE)
+            if m:
+                keys.add(self._normalize_text(m.group(1)))
+            return {k for k in keys if len(k) >= 8}
+
+        index_b: dict[str, list[int]] = {}
+        for ib, chunk in enumerate(cb_list):
+            for key in _keys(chunk.text):
+                index_b.setdefault(key, []).append(ib)
+
+        pairs: List[MatchedPair] = []
+        matched_a: Set[int] = set()
+        matched_b: Set[int] = set()
+
+        for ia, chunk_a in enumerate(ca_list):
+            if ia in matched_a:
+                continue
+            for key in _keys(chunk_a.text):
+                for ib in index_b.get(key, []):
+                    if ib in matched_b:
+                        continue
+                    pairs.append(MatchedPair(
+                        chunk_a=chunk_a,
+                        chunk_b=cb_list[ib],
+                        sim_score=1.0,
+                        is_matched=True,
+                        match_strategy="content_exact",
+                    ))
+                    matched_a.add(ia)
+                    matched_b.add(ib)
+                    break
+                if ia in matched_a:
+                    break
+
+        return (
+            pairs,
+            {id(ca_list[ia]) for ia in matched_a},
+            {id(cb_list[ib]) for ib in matched_b},
+        )
+
     def _best_merged_candidate(
         self,
         source_chunk: Chunk,
@@ -288,13 +348,19 @@ class Matcher:
             return chunks[0]
         first = chunks[0]
         merged_text = "\n".join(c.text for c in chunks if c.text.strip())
-        merged_heading = " + ".join(c.metadata.heading_path for c in chunks if c.metadata.heading_path)
+        from services.chunker import _infer_structure_from_lines
+        idieu, ikhoan, ihp = _infer_structure_from_lines(merged_text.splitlines())
+        merged_heading = ihp or " + ".join(
+            c.metadata.heading_path for c in chunks if c.metadata.heading_path
+        )
         merged_doc = "+".join(c.metadata.doc_id for c in chunks)
         return Chunk(
             text=merged_text,
             metadata=first.metadata.model_copy(
                 update={
                     "doc_id": merged_doc,
+                    "dieu": idieu or first.metadata.dieu,
+                    "khoan": ikhoan or first.metadata.khoan,
                     "heading_path": merged_heading or first.metadata.heading_path,
                 }
             ),
