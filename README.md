@@ -1,31 +1,32 @@
 # Legal RAG Comparator
-> So sánh và phát hiện thay đổi trong văn bản hợp đồng tiếng Việt bằng RAG + LLM
+
+> Xây dựng hệ thống so sánh và phát hiện thay đổi trong văn bản hợp đồng tiếng Việt bằng RAG + LLM chạy Local (offline).
 
 Hệ thống nhận 2 phiên bản hợp đồng (DOCX/PDF), tự động phát hiện thay đổi theo từng điều khoản, trích dẫn bằng chứng trực tiếp từ văn bản gốc và tổng hợp báo cáo bằng tiếng Việt.
 
 ---
 
 ## Mục lục
+
 - [Legal RAG Comparator](#legal-rag-comparator)
   - [Mục lục](#mục-lục)
-  - [Tính năng](#tính-năng)
-  - [Kiến trúc hệ thống](#kiến-trúc-hệ-thống)
-  - [Cấu trúc thư mục](#cấu-trúc-thư-mục)
-  - [Cài đặt](#cài-đặt)
-    - [Yêu cầu](#yêu-cầu)
-    - [1. Clone repo](#1-clone-repo)
-    - [2. Cài UI (local)](#2-cài-ui-local)
-    - [3. Cài Backend (Google Colab)](#3-cài-backend-google-colab)
-  - [Chạy đầy đủ (có backend)](#chạy-đầy-đủ-có-backend)
-  - [Đánh giá mô hình](#đánh-giá-mô-hình)
-    - [Chuẩn bị ground truth](#chuẩn-bị-ground-truth)
-    - [Chạy đánh giá](#chạy-đánh-giá)
-    - [Ví dụ kết quả](#ví-dụ-kết-quả)
-  - [Tech Stack](#tech-stack)
+  - [1. Tính năng](#1-tính-năng)
+  - [2. Kiến trúc hệ thống](#2-kiến-trúc-hệ-thống)
+  - [3. Cấu trúc thư mục](#3-cấu-trúc-thư-mục)
+  - [4. Cài đặt](#4-cài-đặt)
+    - [4.1. Yêu cầu cấu hình](#41-yêu-cầu-cấu-hình)
+      - [Bước 1: Clone repo](#bước-1-clone-repo)
+      - [Bước 2: Cài các thư viện cần thiết cho Front-end (Streamlit)](#bước-2-cài-các-thư-viện-cần-thiết-cho-front-end-streamlit)
+      - [Bước 3: Cài các thư viện cần thiết cho Back-end](#bước-3-cài-các-thư-viện-cần-thiết-cho-back-end)
+    - [4.2. Hướng dẫn sử dụng dự án](#42-hướng-dẫn-sử-dụng-dự-án)
+    - [4.2. Chuẩn bị ground truth](#42-chuẩn-bị-ground-truth)
+    - [4.3. Chạy đánh giá](#43-chạy-đánh-giá)
+    - [4.4. Ví dụ kết quả](#44-ví-dụ-kết-quả)
+  - [5. Tech Stack](#5-tech-stack)
 
 ---
 
-##  Tính năng
+## 1. Tính năng
 
 - **Đọc DOCX và PDF** — chuẩn hóa Unicode, sửa lỗi OCR tự động
 - **Chunking theo cấu trúc pháp lý** — tách chunk theo Điều → Khoản → Điểm
@@ -37,11 +38,12 @@ Hệ thống nhận 2 phiên bản hợp đồng (DOCX/PDF), tự động phát 
 
 ---
 
-##  Kiến trúc hệ thống
+## 2. Kiến trúc hệ thống
 
 ![architecture](images/Screenshot%202026-03-12%20at%2010.44.42.png)
 
 **Luồng xử lý:**
+
 ```
 Upload A+B → reader → chunker → BGE-M3 → data/chroma_db/
            → matcher (ghép cặp Điều/Khoản)
@@ -51,7 +53,7 @@ Upload A+B → reader → chunker → BGE-M3 → data/chroma_db/
 
 ---
 
-##  Cấu trúc thư mục
+## 3. Cấu trúc thư mục
 
 ```
 TTCS/
@@ -117,59 +119,64 @@ TTCS/
 
 ---
 
-## Cài đặt
+## 4. Cài đặt
 
-### Yêu cầu
+### 4.1. Yêu cầu cấu hình
 
 | Thành phần | Phiên bản |
-|---|---|
-| Python | ≥ 3.10 |
-| RAM local | ≥ 8 GB |
-| GPU Colab | T4 16 GB |
+| ---------- | --------- |
+| Python     | ≥ 3.10    |
+| RAM local  | ≥ 8 GB    |
+| GPU Colab  | T4 16 GB  |
 
-### 1. Clone repo
+#### Bước 1: Clone repo
 
 ```bash
-git clone https://github.com/<your-username>/TTCS.git
+git clone https://github.com/KhanhTLN/2Docs-RAG
 cd TTCS
 cp .env.example .env
 ```
 
-### 2. Cài UI (local)
+#### Bước 2: Cài các thư viện cần thiết cho Front-end (Streamlit)
 
 ```bash
 cd ui
 python3 -m venv venv
-source venv/bin/activate        
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Cài Backend (Google Colab)
+#### Bước 3: Cài các thư viện cần thiết cho Back-end
 
-Chạy file notebook/TTCS.ipynd
-
+```bash
+cd backend
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
 ---
 
-##  Chạy đầy đủ (có backend)
+### 4.2. Hướng dẫn sử dụng dự án
 
 ```bash
-# Bước 1 — Chạy backend trên Colab, lấy URL ngrok
-# Bước 2 — Cập nhật .env
-BACKEND_URL=https://xxxx-xx-xxx.ngrok-free.app
+- Tại folder chính RAG/
+
+# Bước 1 — Chạy backend
+cd backend
+python -m uvicorn main:app --reload --port 8080
+
+# Bước 2 — Cập nhật .env, chuyển sang trạng thái Production
 DEMO_MODE=false
 
 # Bước 3 — Chạy UI
 cd ui
-source venv/bin/activate
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 ---
 
-##  Đánh giá mô hình
-
-### Chuẩn bị ground truth
+### 4.2. Chuẩn bị ground truth
 
 Tạo file `evaluation/ground_truth/pair_01.json` cho mỗi cặp tài liệu:
 
@@ -189,7 +196,7 @@ Tạo file `evaluation/ground_truth/pair_01.json` cho mỗi cặp tài liệu:
 }
 ```
 
-### Chạy đánh giá
+### 4.3. Chạy đánh giá
 
 ```bash
 # Lần 1 — baseline
@@ -205,27 +212,25 @@ python evaluation/run_eval.py --threshold 0.75 --note "thr_075"
 python evaluation/compare.py
 ```
 
-### Ví dụ kết quả
+### 4.4. Ví dụ kết quả
 
-| Run ID| Note| Model |  top_k  | thr  |P     | R    |  F1| 
-| --- |---|---|---|---|---|---|---| 
-run_20240301_143022  |baseline     |qwen2.5:7b |   5  | 0.85|  0.812| 0.743| 0.776
-run_20240301_160512  |topk_8  |    qwen2.5:7b   | 8   | 0.85 | 0.834 | 0.771 | 0.801
-run_20240302_090000   | thr_075  |   qwen2.5:7b |   5 |  0.75 | 0.798 | 0.810 | 0.804
+| Run ID              | Note     | Model      | top_k | thr  | P     | R     | F1    |
+| ------------------- | -------- | ---------- | ----- | ---- | ----- | ----- | ----- |
+| run_20240301_143022 | baseline | qwen2.5:7b | 5     | 0.85 | 0.812 | 0.743 | 0.776 |
+| run_20240301_160512 | topk_8   | qwen2.5:7b | 8     | 0.85 | 0.834 | 0.771 | 0.801 |
+| run_20240302_090000 | thr_075  | qwen2.5:7b | 5     | 0.75 | 0.798 | 0.810 | 0.804 |
 
 ---
 
+## 5. Tech Stack
 
-## Tech Stack
-
-| Layer | Công nghệ | Mục đích |
-|---|---|---|
-| UI | Streamlit | Giao diện người dùng |
-| API | FastAPI | REST backend |
-| LLM | Qwen2.5-7B (Ollama) | Phân tích so sánh |
-| Embedding | BGE-M3 (FlagEmbedding) | Vector hóa văn bản |
-| Vector DB | ChromaDB | Lưu trữ và tìm kiếm vector |
-| Doc Parser | python-docx, PyMuPDF | Đọc DOCX/PDF |
-| Runtime | Google Colab T4 | Chạy LLM + Embedding |
+| Layer      | Công nghệ              | Mục đích                   |
+| ---------- | ---------------------- | -------------------------- |
+| UI         | Streamlit              | Giao diện người dùng       |
+| API        | FastAPI                | REST backend               |
+| LLM        | Qwen2.5-7B (Ollama)    | Phân tích so sánh          |
+| Embedding  | BGE-M3 (FlagEmbedding) | Vector hóa văn bản         |
+| Vector DB  | ChromaDB               | Lưu trữ và tìm kiếm vector |
+| Doc Parser | python-docx, PyMuPDF   | Đọc DOCX/PDF               |
 
 ---
